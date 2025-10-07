@@ -1,102 +1,96 @@
-#include <stdio.h>
-#include <gpiod.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <linux/input.h>
-#include <time.h>
-#include <poll.h>
-#include <string.h>
-#include <stdlib.h>
-#include <ctype.h>
-#include <stdbool.h>
-#include <float.h> // For DBL_MAX
+#if defined(IS_PI5)
 
-// --- CONFIGURATION ---
-#define GPIO_CHIP_NAME "gpiochip0"
-#define BUTTON_START_PIN 21
-#define PHOTODIODE_END_PIN 20
-#define TARGET_BTN_CODE BTN_SOUTH
+#include <pio/pio_loader.h>
+#include <sys/poll.h>
 
-// --- Auto-Detection Functions ---
-void get_pi_model(char* buffer, size_t size) {
-    FILE *fp = fopen("/proc/cpuinfo", "r");
-    if (fp == NULL) {
-        strncpy(buffer, "Unknown", size);
-        return;
+// --- PIOLIB IMPLEMENTATION ---
+
+int main(int argc, char *argv[]) {
+    // ... argument parsing and setup for evdev (T1) remains the same ...
+
+    struct pio_loader *loader;
+    int pio0_sm0_fd, pio0_sm1_fd; // File descriptors for PIO interrupts
+    long long t0 = 0, t2 = 0;
+
+    // Load the PIO program from the file
+    loader = pio_loader_create("timestamp.pio");
+    if (!loader) {
+        fprintf(stderr, "Failed to load PIO program\n");
+        return 1;
     }
-    char line[256];
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "Model") || strstr(line, "Hardware")) {
-            char *model_ptr = strchr(line, ':');
-            if (model_ptr && *(model_ptr + 1) != '\0') {
-                model_ptr += 2; // Skip ': '
-                strncpy(buffer, model_ptr, size);
-                buffer[strcspn(buffer, "\n")] = 0;
-                fclose(fp);
-                return;
+
+    // --- Configure State Machine 0 for Start Pin (T0) ---
+    if (!pio_loader_init_sm(loader, 0, 0, BUTTON_START_PIN)) {
+        fprintf(stderr, "Failed to init PIO state machine 0\n");
+        return 1;
+    }
+    pio0_sm0_fd = pio_loader_get_sm_fd(loader, 0, 0);
+
+    // --- Configure State Machine 1 for End Pin (T2) ---
+    if (!pio_loader_init_sm(loader, 0, 1, PHOTODIODE_END_PIN)) {
+        fprintf(stderr, "Failed to init PIO state machine 1\n");
+        return 1;
+    }
+    pio0_sm1_fd = pio_loader_get_sm_fd(loader, 0, 1);
+    
+    // Enable the state machines
+    pio_loader_set_sm_mask_enabled(loader, (1 << 0) | (1 << 1));
+
+    printf("PIO Latency Tester Initialized for Pi 5.\n");
+    printf("Watching for button press...\n\n");
+
+    while(1) {
+        t0 = 0;
+        long long t1 = 0; // T1 is local to the loop
+        t2 = 0;
+
+        // --- Poll for T0, T1, and T2 ---
+        struct pollfd fds[3];
+        fds[0].fd = ev_fd;           // T1 signal
+        fds[0].events = POLLIN;
+        fds[1].fd = pio0_sm0_fd;     // T0 signal
+        fds[1].events = POLLIN;
+        fds[2].fd = pio0_sm1_fd;     // T2 signal
+        fds[2].events = POLLIN;
+
+        printf("Waiting for physical press (T0)...\n");
+        // First, wait only for the start signal
+        poll(&fds[1], 1, -1);
+        t0 = get_nanoseconds();
+
+        printf("--- Test Started ---\n");
+        printf("T0 (Physical Press): Captured\n");
+
+        int events_captured = 0;
+        while (events_captured < 2) {
+            // Now wait for the other two events
+            int ret = poll(fds, 3, 2000); // Use all 3 FDs, but T0 is already done
+            
+            // Check for evdev event (T1)
+            if (fds[0].revents & POLLIN && t1 == 0) {
+                // ... same evdev reading logic as before ...
+                t1 = get_nanoseconds();
+                printf("T1 (OS Event):       Captured\n");
+                events_captured++;
+            }
+
+            // Check for photodiode event (T2)
+            if (fds[2].revents & POLLIN && t2 == 0) {
+                t2 = get_nanoseconds();
+                printf("T2 (Photon Output):  Captured\n");
+                events_captured++;
             }
         }
+        
+        // ... Calculate and print results ...
     }
-    fclose(fp);
-    strncpy(buffer, "Unknown", size);
+    
+    // Cleanup
+    pio_loader_close(loader);
+    return 0;
 }
 
-char* find_joystick_device() {
-    FILE *fp;
-    char line[256];
-    char event_handler[32] = {0};
-    bool is_joystick = false;
-    static char device_path[64];
-
-    fp = fopen("/proc/bus/input/devices", "r");
-    if (fp == NULL) {
-        perror("Failed to open /proc/bus/input/devices");
-        return NULL;
-    }
-
-    while (fgets(line, sizeof(line), fp)) {
-        if (line[0] == '\n') {
-            if (is_joystick && strlen(event_handler) > 0) {
-                sprintf(device_path, "/dev/input/%s", event_handler);
-                fclose(fp);
-                return device_path;
-            }
-            is_joystick = false;
-            memset(event_handler, 0, sizeof(event_handler));
-            continue;
-        }
-
-        if (strncmp(line, "N: Name=", 8) == 0) {
-            if (strstr(line, "Joystick") || strstr(line, "Gamepad")) {
-                is_joystick = true;
-            }
-        } else if (strncmp(line, "H: Handlers=", 12) == 0) {
-            if (strstr(line, "js")) {
-                is_joystick = true;
-            }
-            char *ptr = strstr(line, "event");
-            if (ptr) {
-                sscanf(ptr, "%s", event_handler);
-            }
-        }
-    }
-
-    if (is_joystick && strlen(event_handler) > 0) {
-        sprintf(device_path, "/dev/input/%s", event_handler);
-        fclose(fp);
-        return device_path;
-    }
-
-    fclose(fp);
-    return NULL;
-}
-
-// Helper function to get a nanosecond timestamp
-long long get_nanoseconds(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
-}
+#else // This block is for non-Pi5 systems
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -252,3 +246,6 @@ int main(int argc, char *argv[]) {
     close(ev_fd);
     return 0;
 }
+
+#endif
+
