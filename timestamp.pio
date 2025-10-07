@@ -1,0 +1,6 @@
+.program timestamp_edge
+
+.wrap_target
+    wait 1 pin 0    ; Wait for the specified pin to go high
+    irq set 0       ; Trigger interrupt 0
+.wrap
